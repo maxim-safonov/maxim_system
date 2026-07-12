@@ -108,7 +108,7 @@ life-os/
 
 - аккаунт и проект `Supabase`;
 - бот в `Telegram` и токен;
-- `DeepSeek API key`;
+- `OpenRouter API key`;
 - `Notion internal integration` и ID баз;
 - решение по часовому поясу для расписания;
 - доступ к Git-репозиторию, если хотите сразу вести проект в GitHub.
