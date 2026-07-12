@@ -30,6 +30,166 @@ function stripCodeFence(input: string): string {
     .trim();
 }
 
+function extractJsonObject(input: string): string {
+  const trimmed = stripCodeFence(input);
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+
+  if (start !== -1 && end !== -1 && end > start) {
+    return trimmed.slice(start, end + 1);
+  }
+
+  return trimmed;
+}
+
+function sanitizeJsonLike(input: string): string {
+  return input
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3');
+}
+
+function extractStringField(input: string, field: string): string | undefined {
+  const match = input.match(new RegExp(`"${field}"\\s*:\\s*"([^"]*)"`, "s"));
+  return match?.[1];
+}
+
+function extractNullableStringField(
+  input: string,
+  field: string,
+): string | null | undefined {
+  if (new RegExp(`"${field}"\\s*:\\s*null`, "s").test(input)) {
+    return null;
+  }
+
+  return extractStringField(input, field);
+}
+
+function extractNumberField(input: string, field: string): number | undefined {
+  const match = input.match(
+    new RegExp(`"${field}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`, "s"),
+  );
+  return match ? Number(match[1]) : undefined;
+}
+
+function extractObjectField(
+  input: string,
+  field: string,
+): Record<string, unknown> | undefined {
+  const startMatch = input.match(new RegExp(`"${field}"\\s*:\\s*\\{`, "s"));
+  if (!startMatch || startMatch.index === undefined) {
+    return undefined;
+  }
+
+  const braceStart = input.indexOf("{", startMatch.index);
+  if (braceStart === -1) {
+    return undefined;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = braceStart; i < input.length; i++) {
+    const char = input[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(input.slice(braceStart, i + 1)) as Record<
+            string,
+            unknown
+          >;
+        } catch {
+          return undefined;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function recoverAnalysisResult(rawText: string): InboxAnalysisResult | null {
+  const base = extractJsonObject(rawText);
+  const classification = extractStringField(base, "classification");
+  const summary = extractStringField(base, "summary");
+
+  if (!classification || !summary) {
+    return null;
+  }
+
+  const decision = extractNullableStringField(base, "decision");
+  const targetEntityId = extractNullableStringField(base, "targetEntityId");
+
+  return {
+    classification,
+    summary,
+    confidence: extractNumberField(base, "confidence") ?? 0.5,
+    suggestedTitle: extractNullableStringField(base, "suggestedTitle") ??
+      undefined,
+    suggestedEntityType:
+      extractNullableStringField(base, "suggestedEntityType") ??
+        undefined,
+    suggestedPayload: extractObjectField(base, "suggestedPayload") ?? {},
+    followUpQuestion: extractNullableStringField(base, "followUpQuestion"),
+    agentReply: extractNullableStringField(base, "agentReply") ?? null,
+    decision: decision === "update" || decision === "clarify" ||
+        decision === "create"
+      ? decision
+      : "create",
+    targetEntityId,
+  };
+}
+
+function parseAnalysisResult(rawText: string): InboxAnalysisResult {
+  const candidates = [
+    stripCodeFence(rawText),
+    extractJsonObject(rawText),
+    sanitizeJsonLike(extractJsonObject(rawText)),
+    sanitizeJsonLike(stripCodeFence(rawText)),
+  ];
+
+  let lastError: string | null = null;
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as InboxAnalysisResult;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  const recovered = recoverAnalysisResult(rawText);
+  if (recovered) {
+    return recovered;
+  }
+
+  throw new Error(
+    `Failed to parse OpenRouter JSON response: ${
+      lastError ?? "unknown error"
+    }. Raw: ${rawText.slice(0, 500)}`,
+  );
+}
+
 function extractMessageContent(message: unknown): string | null {
   if (!message || typeof message !== "object") {
     return null;
@@ -111,6 +271,7 @@ export async function classifyInboxItem(input: {
     "For create: briefly acknowledge what was captured and optionally mention the next useful step.",
     "For update: say that you understood this as an update to the current goal/project and what changed.",
     "For clarify: agentReply should mainly be the clarification question.",
+    "Keep agentReply short: one or two short sentences, no more than 220 characters.",
     "Do not mention JSON, schema, databases, Notion, Supabase, or internal processing.",
   ].join("\n");
 
@@ -120,43 +281,57 @@ export async function classifyInboxItem(input: {
     relatedEntities: input.relatedEntities ?? [],
   });
 
-  const response = await fetch(`${openrouterBaseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${openrouterApiKey}`,
-      "http-referer": "https://life-os.local",
-      "x-title": "Life OS",
-    },
-    body: JSON.stringify({
-      model: openrouterModel,
-      max_tokens: 800,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-        {
-          role: "user",
-          content: userContent,
-        },
-      ],
-    }),
-  });
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), 45000);
 
-  const body = await response.json();
-  if (!response.ok) {
-    throw new Error(
-      `OpenRouter API error: ${response.status} ${JSON.stringify(body)}`,
-    );
+  try {
+    const response = await fetch(`${openrouterBaseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${openrouterApiKey}`,
+        "http-referer": "https://life-os.local",
+        "x-title": "Life OS",
+      },
+      body: JSON.stringify({
+        model: openrouterModel,
+        max_tokens: 800,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "system",
+            content: prompt,
+          },
+          {
+            role: "user",
+            content: userContent,
+          },
+        ],
+      }),
+      signal: abortController.signal,
+    });
+
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(
+        `OpenRouter API error: ${response.status} ${JSON.stringify(body)}`,
+      );
+    }
+
+    const rawText = extractMessageContent(body?.choices?.[0]?.message);
+    if (!rawText) {
+      throw new Error("OpenRouter API returned empty content");
+    }
+
+    const parsed = parseAnalysisResult(rawText);
+    return { result: parsed, rawText };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("OpenRouter request timed out after 45 seconds");
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const rawText = extractMessageContent(body?.choices?.[0]?.message);
-  if (!rawText) {
-    throw new Error("OpenRouter API returned empty content");
-  }
-
-  const parsed = JSON.parse(stripCodeFence(rawText)) as InboxAnalysisResult;
-  return { result: parsed, rawText };
 }
