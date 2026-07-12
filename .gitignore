@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+node_modules/
+.supabase/
+dist/
+coverage/
+
+tmp/
+*.log
