@@ -129,6 +129,32 @@ function buildAgentReply(input: {
   return lines.join("\n");
 }
 
+function pickTelegramReply(input: {
+  llmReply?: string | null;
+  decision?: "create" | "update" | "clarify";
+  entityType?: string | null;
+  title?: string | null;
+  targetTitle?: string | null;
+  summary: string;
+  payload?: Record<string, unknown>;
+  followUpQuestion?: string | null;
+}): string {
+  const llmReply = input.llmReply?.trim();
+  if (llmReply) {
+    return llmReply;
+  }
+
+  return buildAgentReply({
+    decision: input.decision,
+    entityType: input.entityType,
+    title: input.title,
+    targetTitle: input.targetTitle,
+    summary: input.summary,
+    payload: input.payload,
+    followUpQuestion: input.followUpQuestion,
+  });
+}
+
 function mergePayload(
   existingPayload: Record<string, unknown> | null | undefined,
   incomingPayload: Record<string, unknown> | null | undefined,
@@ -344,7 +370,8 @@ Deno.serve(async (request) => {
       try {
         await sendTelegramMessage(
           inboxItem.external_chat_id,
-          buildAgentReply({
+          pickTelegramReply({
+            llmReply: analysis.result.agentReply ?? null,
             entityType: analysis.result.suggestedEntityType ??
               analysis.result.classification,
             decision: analysis.result.decision ?? "create",

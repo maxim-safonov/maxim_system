@@ -18,6 +18,7 @@ export type InboxAnalysisResult = {
   suggestedEntityType?: string;
   suggestedPayload?: Record<string, unknown>;
   followUpQuestion?: string | null;
+  agentReply?: string | null;
   decision?: "create" | "update" | "clarify";
   targetEntityId?: string | null;
 };
@@ -89,10 +90,10 @@ export async function classifyInboxItem(input: {
   rawText: string;
 }> {
   const prompt = [
-    "You classify personal inbox items for a personal life operating system.",
+    "You classify personal inbox items for a personal life operating system and write a warm Telegram reply.",
     "Return strict JSON only.",
-    'Schema: {"classification":"string","summary":"string","confidence":0.0,"suggestedTitle":"string|null","suggestedEntityType":"note|task|idea|goal|project|memory|finance|event|unknown","suggestedPayload":{},"followUpQuestion":"string|null","decision":"create|update|clarify","targetEntityId":"string|null"}',
-    "Use Russian in summary, suggestedTitle, and followUpQuestion.",
+    'Schema: {"classification":"string","summary":"string","confidence":0.0,"suggestedTitle":"string|null","suggestedEntityType":"note|task|idea|goal|project|memory|finance|event|unknown","suggestedPayload":{},"followUpQuestion":"string|null","agentReply":"string|null","decision":"create|update|clarify","targetEntityId":"string|null"}',
+    "Use Russian in summary, suggestedTitle, followUpQuestion, and agentReply.",
     "Do not invent facts that are not present in the message.",
     "Use 'goal' when the message describes a desired future outcome or aspiration over time.",
     "Use 'project' when the message describes a multi-step initiative, workstream, or concrete undertaking.",
@@ -105,6 +106,12 @@ export async function classifyInboxItem(input: {
     "If this is clearly a new independent item, use decision='create' and targetEntityId=null.",
     "When using decision='update', do not create a duplicate. Reuse the existing entity and provide only the refreshed summary/title/payload that should replace or enrich it.",
     "Only use targetEntityId values that appear in relatedEntities. Otherwise return null.",
+    "agentReply should sound natural, human, and concise, like a thoughtful assistant in Telegram.",
+    "Avoid robotic labels like 'Тип' or 'Кратко' unless they genuinely help.",
+    "For create: briefly acknowledge what was captured and optionally mention the next useful step.",
+    "For update: say that you understood this as an update to the current goal/project and what changed.",
+    "For clarify: agentReply should mainly be the clarification question.",
+    "Do not mention JSON, schema, databases, Notion, Supabase, or internal processing.",
   ].join("\n");
 
   const userContent = JSON.stringify({
