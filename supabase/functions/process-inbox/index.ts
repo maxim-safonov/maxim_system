@@ -54,6 +54,9 @@ type RelatedEntity = {
   revision?: number;
 };
 
+type NormalizedAnalysis = ReturnType<typeof normalizeAnalysisDecision>;
+type SanitizedAnalysisResult = ReturnType<typeof sanitizeAnalysisResult>;
+
 function humanizeEntityType(entityType?: string | null): string {
   switch (entityType) {
     case "goal":
@@ -165,6 +168,306 @@ function mergePayload(
   };
 }
 
+function isPlaceholderValue(value?: string | null): boolean {
+  if (!value) {
+    return false;
+  }
+
+  return [
+    "string",
+    "string|null",
+    "create|update|clarify",
+    "note|task|idea|goal|project|memory|finance|event|unknown",
+  ].includes(value.trim());
+}
+
+function inferEntityTypeFromText(text?: string | null): string {
+  if (!text) {
+    return "note";
+  }
+
+  if (/\bпроект\b/i.test(text)) {
+    return "project";
+  }
+
+  if (/\bзадач[аеиу]\b/i.test(text)) {
+    return "task";
+  }
+
+  if (/\bцель\b/i.test(text) || /\bхочу\b/i.test(text)) {
+    return "goal";
+  }
+
+  return "note";
+}
+
+function sanitizeAnalysisResult(input: {
+  result: Awaited<ReturnType<typeof classifyInboxItem>>["result"];
+  originalText?: string | null;
+}): {
+  classification: string;
+  summary: string;
+  confidence: number;
+  suggestedTitle?: string | null;
+  suggestedEntityType?: string | null;
+  suggestedPayload?: Record<string, unknown>;
+  followUpQuestion?: string | null;
+  agentReply?: string | null;
+  decision?: "create" | "update" | "clarify";
+  targetEntityId?: string | null;
+} {
+  const fallbackSummary = input.originalText?.trim() ||
+    "Новая запись пользователя";
+  const fallbackType = !isPlaceholderValue(input.result.suggestedEntityType)
+    ? input.result.suggestedEntityType
+    : !isPlaceholderValue(input.result.classification)
+    ? input.result.classification
+    : inferEntityTypeFromText(input.originalText);
+
+  return {
+    classification: !isPlaceholderValue(input.result.classification)
+      ? input.result.classification
+      : fallbackType ?? "note",
+    summary: !isPlaceholderValue(input.result.summary)
+      ? input.result.summary
+      : fallbackSummary,
+    confidence: input.result.confidence ?? 0.5,
+    suggestedTitle: !isPlaceholderValue(input.result.suggestedTitle)
+      ? input.result.suggestedTitle ?? null
+      : null,
+    suggestedEntityType: !isPlaceholderValue(input.result.suggestedEntityType)
+      ? input.result.suggestedEntityType ?? null
+      : fallbackType ?? "note",
+    suggestedPayload: input.result.suggestedPayload ?? {},
+    followUpQuestion: !isPlaceholderValue(input.result.followUpQuestion)
+      ? input.result.followUpQuestion ?? null
+      : null,
+    agentReply: !isPlaceholderValue(input.result.agentReply)
+      ? input.result.agentReply ?? null
+      : null,
+    decision: input.result.decision === "create" ||
+        input.result.decision === "update" ||
+        input.result.decision === "clarify"
+      ? input.result.decision
+      : undefined,
+    targetEntityId: !isPlaceholderValue(input.result.targetEntityId)
+      ? input.result.targetEntityId ?? null
+      : null,
+  };
+}
+
+function hasUpdateCue(text?: string | null): boolean {
+  if (!text) {
+    return false;
+  }
+
+  return /\b(добавь|дополни|уточни|уточню|обнови|исправь|измени|поменяй|скорректируй)\b/i
+    .test(text);
+}
+
+function tokenizeText(text?: string | null): string[] {
+  if (!text) {
+    return [];
+  }
+
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+}
+
+function entitySearchText(entity: RelatedEntity): string {
+  return [
+    entity.title ?? "",
+    entity.summary ?? "",
+    JSON.stringify(entity.payload ?? {}),
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+function chooseUpdateTarget(
+  text: string | null | undefined,
+  entityType: string | null | undefined,
+  relatedEntities: RelatedEntity[],
+): RelatedEntity | null {
+  const tokens = tokenizeText(text);
+  const candidates = relatedEntities.filter((entity) =>
+    entity.entity_type === "goal" || entity.entity_type === "project"
+  ).filter((entity) => !entityType || entity.entity_type === entityType);
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  const scored = candidates.map((entity, index) => {
+    const haystack = entitySearchText(entity);
+    const overlap = tokens.reduce((score, token) => {
+      return haystack.includes(token) ? score + 1 : score;
+    }, 0);
+
+    return {
+      entity,
+      overlap,
+      index,
+    };
+  }).sort((left, right) => {
+    if (right.overlap !== left.overlap) {
+      return right.overlap - left.overlap;
+    }
+
+    return left.index - right.index;
+  });
+
+  const best = scored[0];
+  if (!best) {
+    return null;
+  }
+
+  if (best.overlap >= 1) {
+    return best.entity;
+  }
+
+  if (hasUpdateCue(text) && scored.length === 1) {
+    return best.entity;
+  }
+
+  return null;
+}
+
+function normalizeAnalysisDecision(input: {
+  text?: string | null;
+  result: SanitizedAnalysisResult;
+  relatedEntities: RelatedEntity[];
+}): {
+  decision: "create" | "update" | "clarify";
+  targetEntityId: string | null;
+} {
+  if (input.result.decision === "update" && input.result.targetEntityId) {
+    return {
+      decision: "update",
+      targetEntityId: input.result.targetEntityId,
+    };
+  }
+
+  const suggestedType = input.result.suggestedEntityType;
+  const looksLikeUpdate = hasUpdateCue(input.text) ||
+    input.result.classification === "goal_update" ||
+    input.result.classification === "project_update";
+
+  if (!looksLikeUpdate) {
+    return {
+      decision: input.result.decision ?? "create",
+      targetEntityId: input.result.targetEntityId ?? null,
+    };
+  }
+
+  const target = chooseUpdateTarget(
+    input.text,
+    suggestedType,
+    input.relatedEntities,
+  );
+
+  if (target) {
+    return {
+      decision: "update",
+      targetEntityId: target.id,
+    };
+  }
+
+  return {
+    decision: input.result.decision ?? "create",
+    targetEntityId: input.result.targetEntityId ?? null,
+  };
+}
+
+function buildFallbackAnalysis(input: {
+  text?: string | null;
+  relatedEntities: RelatedEntity[];
+}): Awaited<ReturnType<typeof classifyInboxItem>>["result"] {
+  const text = input.text?.trim() ?? "";
+  const target = chooseUpdateTarget(text, undefined, input.relatedEntities);
+
+  if (hasUpdateCue(text) && target) {
+    return {
+      classification: `${target.entity_type}_update`,
+      summary: text || "Пользователь прислал уточнение к существующей записи",
+      confidence: 0.35,
+      suggestedTitle: target.title ?? undefined,
+      suggestedEntityType: target.entity_type,
+      suggestedPayload: {},
+      followUpQuestion: null,
+      agentReply: `Понял, это уточнение к текущей записи${
+        target.title ? ` «${target.title}»` : ""
+      }.`,
+      decision: "update",
+      targetEntityId: target.id,
+    };
+  }
+
+  if (hasUpdateCue(text)) {
+    return {
+      classification: "clarify",
+      summary: text || "Нужно уточнение",
+      confidence: 0.3,
+      suggestedTitle: undefined,
+      suggestedEntityType: "note",
+      suggestedPayload: {},
+      followUpQuestion:
+        "Уточни, пожалуйста, к какой именно цели или проекту это добавить?",
+      agentReply:
+        "Уточни, пожалуйста, к какой именно цели или проекту это добавить?",
+      decision: "clarify",
+      targetEntityId: null,
+    };
+  }
+
+  if (/\bпроект\b/i.test(text)) {
+    return {
+      classification: "project",
+      summary: text || "Новый проект",
+      confidence: 0.3,
+      suggestedTitle: undefined,
+      suggestedEntityType: "project",
+      suggestedPayload: {},
+      followUpQuestion: null,
+      agentReply: "Зафиксировал это как проект.",
+      decision: "create",
+      targetEntityId: null,
+    };
+  }
+
+  if (/\bцель\b/i.test(text) || /\bхочу\b/i.test(text)) {
+    return {
+      classification: "goal",
+      summary: text || "Новая цель",
+      confidence: 0.3,
+      suggestedTitle: undefined,
+      suggestedEntityType: "goal",
+      suggestedPayload: {},
+      followUpQuestion: null,
+      agentReply: "Зафиксировал это как цель.",
+      decision: "create",
+      targetEntityId: null,
+    };
+  }
+
+  return {
+    classification: "note",
+    summary: text || "Новая заметка",
+    confidence: 0.25,
+    suggestedTitle: undefined,
+    suggestedEntityType: "note",
+    suggestedPayload: {},
+    followUpQuestion: null,
+    agentReply: "Сохранил это как заметку.",
+    decision: "create",
+    targetEntityId: null,
+  };
+}
+
 Deno.serve(async (request) => {
   const correlationId = getCorrelationId(request);
   let claimedJob: ClaimedJob | undefined;
@@ -229,20 +532,50 @@ Deno.serve(async (request) => {
       limit: 25,
     });
 
-    const analysis = await classifyInboxItem({
-      contentType: inboxItem.content_type,
+    let analysis: Awaited<ReturnType<typeof classifyInboxItem>>;
+    try {
+      analysis = await classifyInboxItem({
+        contentType: inboxItem.content_type,
+        text: inboxItem.original_text,
+        relatedEntities: relatedEntities
+          .filter((entity) =>
+            entity.entity_type === "goal" || entity.entity_type === "project"
+          )
+          .map((entity) => ({
+            id: entity.id,
+            entityType: entity.entity_type,
+            title: entity.title,
+            summary: entity.summary,
+            payload: entity.payload ?? {},
+          })),
+      });
+    } catch (classificationError) {
+      logError("process_inbox_llm_fallback_used", {
+        correlationId,
+        inboxItemId: inboxItem.id,
+        error: classificationError instanceof Error
+          ? classificationError.message
+          : String(classificationError),
+      });
+
+      analysis = {
+        rawText: "FALLBACK_ANALYSIS",
+        result: buildFallbackAnalysis({
+          text: inboxItem.original_text,
+          relatedEntities,
+        }),
+      };
+    }
+
+    const sanitizedAnalysis: SanitizedAnalysisResult = sanitizeAnalysisResult({
+      result: analysis.result,
+      originalText: inboxItem.original_text,
+    });
+
+    const normalizedAnalysis: NormalizedAnalysis = normalizeAnalysisDecision({
       text: inboxItem.original_text,
-      relatedEntities: relatedEntities
-        .filter((entity) =>
-          entity.entity_type === "goal" || entity.entity_type === "project"
-        )
-        .map((entity) => ({
-          id: entity.id,
-          entityType: entity.entity_type,
-          title: entity.title,
-          summary: entity.summary,
-          payload: entity.payload ?? {},
-        })),
+      result: sanitizedAnalysis,
+      relatedEntities,
     });
 
     await insertRow(
@@ -253,8 +586,8 @@ Deno.serve(async (request) => {
         model_provider: "openrouter",
         model_name: getOpenRouterModel(),
         output_text: analysis.rawText,
-        output_json: analysis.result,
-        confidence: analysis.result.confidence ?? null,
+        output_json: sanitizedAnalysis,
+        confidence: sanitizedAnalysis.confidence ?? null,
       },
       {
         select: "id",
@@ -264,11 +597,11 @@ Deno.serve(async (request) => {
     let replyTargetTitle: string | null = null;
 
     if (
-      analysis.result.decision === "update" &&
-      analysis.result.targetEntityId
+      normalizedAnalysis.decision === "update" &&
+      normalizedAnalysis.targetEntityId
     ) {
       const targetEntity = relatedEntities.find((entity) =>
-        entity.id === analysis.result.targetEntityId
+        entity.id === normalizedAnalysis.targetEntityId
       );
 
       if (targetEntity) {
@@ -280,13 +613,14 @@ Deno.serve(async (request) => {
             id: `eq.${targetEntity.id}`,
           },
           {
-            title: analysis.result.suggestedTitle ?? targetEntity.title,
-            summary: analysis.result.summary,
+            inbox_item_id: inboxItem.id,
+            title: sanitizedAnalysis.suggestedTitle ?? targetEntity.title,
+            summary: sanitizedAnalysis.summary,
             payload: mergePayload(
               targetEntity.payload,
-              analysis.result.suggestedPayload ?? {},
+              sanitizedAnalysis.suggestedPayload ?? {},
             ),
-            confidence: analysis.result.confidence ?? null,
+            confidence: sanitizedAnalysis.confidence ?? null,
             updated_by: "ai",
             revision: (targetEntity.revision ?? 1) + 1,
             notion_synced_at: null,
@@ -298,12 +632,12 @@ Deno.serve(async (request) => {
           "proposed_entities",
           {
             inbox_item_id: inboxItem.id,
-            entity_type: analysis.result.suggestedEntityType ?? "unknown",
+            entity_type: sanitizedAnalysis.suggestedEntityType ?? "unknown",
             status: "proposed",
-            title: analysis.result.suggestedTitle ?? null,
-            summary: analysis.result.summary,
-            payload: analysis.result.suggestedPayload ?? {},
-            confidence: analysis.result.confidence ?? null,
+            title: sanitizedAnalysis.suggestedTitle ?? null,
+            summary: sanitizedAnalysis.summary,
+            payload: sanitizedAnalysis.suggestedPayload ?? {},
+            confidence: sanitizedAnalysis.confidence ?? null,
             created_by: "ai",
             updated_by: "system",
           },
@@ -312,17 +646,17 @@ Deno.serve(async (request) => {
           },
         );
       }
-    } else if (analysis.result.decision !== "clarify") {
+    } else if (normalizedAnalysis.decision !== "clarify") {
       await insertRow(
         "proposed_entities",
         {
           inbox_item_id: inboxItem.id,
-          entity_type: analysis.result.suggestedEntityType ?? "unknown",
+          entity_type: sanitizedAnalysis.suggestedEntityType ?? "unknown",
           status: "proposed",
-          title: analysis.result.suggestedTitle ?? null,
-          summary: analysis.result.summary,
-          payload: analysis.result.suggestedPayload ?? {},
-          confidence: analysis.result.confidence ?? null,
+          title: sanitizedAnalysis.suggestedTitle ?? null,
+          summary: sanitizedAnalysis.summary,
+          payload: sanitizedAnalysis.suggestedPayload ?? {},
+          confidence: sanitizedAnalysis.confidence ?? null,
           created_by: "ai",
           updated_by: "system",
         },
@@ -340,9 +674,9 @@ Deno.serve(async (request) => {
       {
         processing_status: "processed",
         processed_at: new Date().toISOString(),
-        preliminary_type: analysis.result.classification,
-        preliminary_summary: analysis.result.summary,
-        ai_confidence: analysis.result.confidence ?? null,
+        preliminary_type: sanitizedAnalysis.classification,
+        preliminary_summary: sanitizedAnalysis.summary,
+        ai_confidence: sanitizedAnalysis.confidence ?? null,
         locked_at: null,
         locked_by: null,
         updated_by: "ai",
@@ -360,8 +694,8 @@ Deno.serve(async (request) => {
         locked_at: null,
         locked_by: null,
         result: {
-          classification: analysis.result.classification,
-          summary: analysis.result.summary,
+          classification: sanitizedAnalysis.classification,
+          summary: sanitizedAnalysis.summary,
         },
       },
     );
@@ -371,14 +705,14 @@ Deno.serve(async (request) => {
         await sendTelegramMessage(
           inboxItem.external_chat_id,
           pickTelegramReply({
-            llmReply: analysis.result.agentReply ?? null,
-            entityType: analysis.result.suggestedEntityType ??
-              analysis.result.classification,
-            decision: analysis.result.decision ?? "create",
-            title: analysis.result.suggestedTitle ?? null,
-            summary: analysis.result.summary,
-            payload: analysis.result.suggestedPayload ?? {},
-            followUpQuestion: analysis.result.followUpQuestion ?? null,
+            llmReply: sanitizedAnalysis.agentReply ?? null,
+            entityType: sanitizedAnalysis.suggestedEntityType ??
+              sanitizedAnalysis.classification,
+            decision: normalizedAnalysis.decision,
+            title: sanitizedAnalysis.suggestedTitle ?? null,
+            summary: sanitizedAnalysis.summary,
+            payload: sanitizedAnalysis.suggestedPayload ?? {},
+            followUpQuestion: sanitizedAnalysis.followUpQuestion ?? null,
             targetTitle: replyTargetTitle,
           }),
         );
