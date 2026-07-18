@@ -23,6 +23,21 @@ export type InboxAnalysisResult = {
   targetEntityId?: string | null;
 };
 
+export type EveningDigestResult = {
+  topics: string[];
+  daySummary: string;
+};
+
+export type EveningReplyResult = {
+  classification: "disengaged" | "crisis" | "brief" | "substantive";
+  userReflection: string;
+  needsClarification: boolean;
+  clarificationQuestion: string | null;
+  repeatedTopic: string | null;
+  insightText: string | null;
+  closingText: string;
+};
+
 function stripCodeFence(input: string): string {
   return input
     .replace(/^```(?:json)?/i, "")
@@ -190,6 +205,31 @@ function parseAnalysisResult(rawText: string): InboxAnalysisResult {
   );
 }
 
+function parseJsonPayload<T>(rawText: string): T {
+  const candidates = [
+    stripCodeFence(rawText),
+    extractJsonObject(rawText),
+    sanitizeJsonLike(extractJsonObject(rawText)),
+    sanitizeJsonLike(stripCodeFence(rawText)),
+  ];
+
+  let lastError: string | null = null;
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as T;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  throw new Error(
+    `Failed to parse OpenRouter JSON payload: ${
+      lastError ?? "unknown error"
+    }. Raw: ${rawText.slice(0, 500)}`,
+  );
+}
+
 function extractMessageContent(message: unknown): string | null {
   if (!message || typeof message !== "object") {
     return null;
@@ -233,6 +273,68 @@ function extractMessageContent(message: unknown): string | null {
 
 export function getOpenRouterModel(): string {
   return openrouterModel;
+}
+
+async function callOpenRouterText(
+  prompt: string,
+  userContent: string,
+  options: {
+    maxTokens?: number;
+    temperature?: number;
+  } = {},
+): Promise<string> {
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), 45000);
+
+  try {
+    const response = await fetch(`${openrouterBaseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${openrouterApiKey}`,
+        "http-referer": "https://life-os.local",
+        "x-title": "Life OS",
+      },
+      body: JSON.stringify({
+        model: openrouterModel,
+        max_tokens: options.maxTokens ?? 800,
+        temperature: options.temperature ?? 0.2,
+        messages: [
+          {
+            role: "system",
+            content: prompt,
+          },
+          {
+            role: "user",
+            content: userContent,
+          },
+        ],
+      }),
+      signal: abortController.signal,
+    });
+
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(
+        `OpenRouter API error: ${response.status} ${JSON.stringify(body)}`,
+      );
+    }
+
+    const rawText = extractMessageContent(body?.choices?.[0]?.message);
+    if (!rawText) {
+      throw new Error("OpenRouter API returned empty content");
+    }
+
+    return rawText;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("OpenRouter request timed out after 45 seconds");
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function classifyInboxItem(input: {
@@ -281,57 +383,178 @@ export async function classifyInboxItem(input: {
     relatedEntities: input.relatedEntities ?? [],
   });
 
-  const abortController = new AbortController();
-  const timeout = setTimeout(() => abortController.abort(), 45000);
+  const rawText = await callOpenRouterText(prompt, userContent);
+  const parsed = parseAnalysisResult(rawText);
+  return { result: parsed, rawText };
+}
 
-  try {
-    const response = await fetch(`${openrouterBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${openrouterApiKey}`,
-        "http-referer": "https://life-os.local",
-        "x-title": "Life OS",
-      },
-      body: JSON.stringify({
-        model: openrouterModel,
-        max_tokens: 800,
-        temperature: 0.2,
-        messages: [
-          {
-            role: "system",
-            content: prompt,
-          },
-          {
-            role: "user",
-            content: userContent,
-          },
-        ],
-      }),
-      signal: abortController.signal,
-    });
+export async function summarizeEveningContext(input: {
+  dateLabel: string;
+  highlights: string[];
+  openLoops: string[];
+  activeProjects: string[];
+  recentUserSignals: string[];
+}): Promise<string> {
+  const prompt = [
+    "You write a genuinely human evening check-in message for a personal Telegram assistant.",
+    "Write in Russian.",
+    "Sound warm, grounded, tactful, and psychologically natural.",
+    "Do not sound like a coach, manager, productivity app, therapist cliche, or AI assistant.",
+    "The user should feel understood, not analyzed.",
+    "Base the message only on the supplied context, but transform it into natural human language.",
+    "Never quote raw command-like phrases such as notes, capture requests, shopping reminders, or terse inbox fragments.",
+    "Prefer emotional and lived signals over todo-like fragments when both are available.",
+    "Structure:",
+    "1. one short opening line that gently reflects the texture of the day;",
+    "2. one short line that names either something good or something still unresolved;",
+    "3. three very short questions, each on its own line.",
+    "The three questions should ask about:",
+    "- what felt like the main result of the day;",
+    "- what is still hanging in the air;",
+    "- what the person wants to lean into tomorrow.",
+    "Avoid over-specificity unless the context is clearly personal and lived.",
+    "Do not mention systems, databases, Notion, prompts, or internal mechanics.",
+    "Return only the final Russian text for the user.",
+  ].join("\n");
 
-    const body = await response.json();
-    if (!response.ok) {
-      throw new Error(
-        `OpenRouter API error: ${response.status} ${JSON.stringify(body)}`,
-      );
-    }
+  return await callOpenRouterText(prompt, JSON.stringify(input), {
+    maxTokens: 280,
+    temperature: 0.6,
+  });
+}
 
-    const rawText = extractMessageContent(body?.choices?.[0]?.message);
-    if (!rawText) {
-      throw new Error("OpenRouter API returned empty content");
-    }
+export async function buildEveningDigest(input: {
+  dateLabel: string;
+  messages: Array<{
+    text: string;
+    time: string;
+  }>;
+}): Promise<EveningDigestResult> {
+  const prompt = [
+    "You compress a user's day into a short evening digest for a personal Telegram assistant.",
+    "Return strict JSON only.",
+    'Schema: {"topics":["string"],"daySummary":"string"}',
+    "Write in Russian.",
+    "Topics should be short, human, and concrete, 1 to 4 items total.",
+    "daySummary should be 1 or 2 short sentences, warm and factual.",
+    "Use only what is actually present in the messages.",
+    "Do not mention AI, prompts, databases, or analysis.",
+  ].join("\n");
 
-    const parsed = parseAnalysisResult(rawText);
-    return { result: parsed, rawText };
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("OpenRouter request timed out after 45 seconds");
-    }
+  const rawText = await callOpenRouterText(prompt, JSON.stringify(input), {
+    maxTokens: 220,
+    temperature: 0.25,
+  });
 
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+  const parsed = parseJsonPayload<Partial<EveningDigestResult>>(rawText);
+  const topics = Array.isArray(parsed.topics)
+    ? parsed.topics
+      .filter((value) => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .slice(0, 4)
+    : [];
+  const daySummary = typeof parsed.daySummary === "string"
+    ? parsed.daySummary.trim()
+    : "";
+
+  if (!topics.length && !daySummary) {
+    throw new Error("Empty evening digest");
   }
+
+  return {
+    topics,
+    daySummary,
+  };
+}
+
+export async function analyzeEveningReply(input: {
+  daySummary: string;
+  topics: string[];
+  userReply: string;
+  clarificationAlreadyAsked: boolean;
+}): Promise<EveningReplyResult> {
+  const prompt = [
+    "You analyze a user's evening check-in reply for a personal Telegram assistant.",
+    "Return strict JSON only.",
+    'Schema: {"classification":"disengaged|crisis|brief|substantive","userReflection":"string","needsClarification":true,"clarificationQuestion":"string|null","repeatedTopic":"string|null","insightText":"string|null","closingText":"string"}',
+    "Write all strings in Russian.",
+    "The assistant should be warm, short, and psychologically careful.",
+    "Use classification='disengaged' if the user does not want to continue.",
+    "Use classification='crisis' if the reply sounds emotionally dangerous or crisis-like.",
+    "Use classification='brief' if the reply is very short or too generic and one clarifying question would help.",
+    "Use classification='substantive' if the answer is already meaningful enough.",
+    "Set needsClarification=true only for classification='brief' and only if clarificationAlreadyAsked is false.",
+    "clarificationQuestion must be only one short question.",
+    "insightText is optional and should only appear when the same topic clearly repeats across the day summary and the evening reply.",
+    "The insight must be observation plus question, not diagnosis or interpretation.",
+    "closingText should fit the classification:",
+    "- disengaged: a soft release, no pressure;",
+    "- crisis: supportive and calm, suggest reaching out for help if needed;",
+    "- substantive: thank them, optionally mention the repeated topic if present, and wish a good night;",
+    "- brief with clarification: closingText should be empty.",
+    "Do not invent facts.",
+  ].join("\n");
+
+  const rawText = await callOpenRouterText(prompt, JSON.stringify(input), {
+    maxTokens: 320,
+    temperature: 0.25,
+  });
+
+  const parsed = parseJsonPayload<Partial<EveningReplyResult>>(rawText);
+  const classification =
+    parsed.classification === "disengaged" || parsed.classification === "crisis" ||
+      parsed.classification === "brief" || parsed.classification === "substantive"
+      ? parsed.classification
+      : "substantive";
+
+  return {
+    classification,
+    userReflection: typeof parsed.userReflection === "string"
+      ? parsed.userReflection.trim()
+      : input.userReply.trim(),
+    needsClarification: Boolean(parsed.needsClarification) &&
+      classification === "brief" && !input.clarificationAlreadyAsked,
+    clarificationQuestion: typeof parsed.clarificationQuestion === "string"
+      ? parsed.clarificationQuestion.trim()
+      : null,
+    repeatedTopic: typeof parsed.repeatedTopic === "string"
+      ? parsed.repeatedTopic.trim()
+      : null,
+    insightText: typeof parsed.insightText === "string"
+      ? parsed.insightText.trim()
+      : null,
+    closingText: typeof parsed.closingText === "string"
+      ? parsed.closingText.trim()
+      : "",
+  };
+}
+
+export async function summarizeWeeklyReview(input: {
+  weekStartDate: string;
+  weekEndDate: string;
+  processedItems: Array<{
+    summary: string | null;
+    type: string | null;
+    createdAt: string;
+  }>;
+  proposedEntities: Array<{
+    entityType: string;
+    title: string | null;
+    summary: string | null;
+  }>;
+}): Promise<string> {
+  const prompt = [
+    "You prepare a weekly review message for a personal Telegram assistant.",
+    "Write in Russian.",
+    "Structure the message for Telegram with short sections.",
+    "Cover: key events, progress, open loops, ideas/materials, and suggested priorities for next week.",
+    "Do not invent facts.",
+    "Return plain text only.",
+  ].join("\n");
+
+  return await callOpenRouterText(prompt, JSON.stringify(input), {
+    maxTokens: 700,
+    temperature: 0.35,
+  });
 }

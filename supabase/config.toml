@@ -13,6 +13,12 @@ verify_jwt = false
 [functions.notion-sync]
 verify_jwt = false
 
+[functions.evening-dialog]
+verify_jwt = false
+
+[functions.weekly-review]
+verify_jwt = false
+
 [api]
 enabled = true
 # Port to use for the API URL.

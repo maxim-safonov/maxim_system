@@ -1,11 +1,17 @@
 import { readOptionalEnv, requireEnv } from "../_shared/env.ts";
+import {
+  DailySessionRecord,
+  EveningSessionMetadata,
+  EveningInsightCandidate,
+  syncEveningSessionToNotion,
+} from "../_shared/evening.ts";
 import { getCorrelationId } from "../_shared/correlation.ts";
 import {
   jsonResponse,
   methodNotAllowed,
   serverError,
 } from "../_shared/http.ts";
-import { logError, logInfo } from "../_shared/log.ts";
+import { logError, logInfo, logWarn } from "../_shared/log.ts";
 import {
   callRpc,
   getRows,
@@ -13,10 +19,16 @@ import {
   updateRows,
 } from "../_shared/supabase.ts";
 import {
+  analyzeEveningReply,
   classifyInboxItem,
   getOpenRouterModel,
 } from "../_shared/openrouter.ts";
-import { sendTelegramMessage } from "../_shared/telegram.ts";
+import {
+  downloadTelegramFile,
+  sendTelegramMessage,
+} from "../_shared/telegram.ts";
+import { uploadObject } from "../_shared/storage.ts";
+import { getLocalDateString } from "../_shared/time.ts";
 
 const openrouterBaseUrl = readOptionalEnv(
   "OPENROUTER_BASE_URL",
@@ -25,6 +37,9 @@ const openrouterBaseUrl = readOptionalEnv(
 const openrouterModel = readOptionalEnv(
   "OPENROUTER_MODEL",
   "openai/gpt-4.1-mini",
+);
+const retryBaseSeconds = Number(
+  readOptionalEnv("PROCESS_INBOX_RETRY_BASE_SECONDS", "60"),
 );
 requireEnv("OPENROUTER_API_KEY");
 
@@ -37,11 +52,30 @@ type ClaimedJob = {
   correlation_id: string;
 };
 
+type ProcessingJobState = {
+  id: string;
+  attempt_count: number;
+  max_attempts: number;
+};
+
 type InboxItem = {
   id: string;
   content_type: string;
   original_text: string | null;
   external_chat_id: string | null;
+  created_at: string;
+};
+
+type InboxAttachment = {
+  id: string;
+  attachment_type: string;
+  telegram_file_id: string | null;
+  storage_bucket: string;
+  storage_path: string;
+  mime_type: string | null;
+  file_name: string | null;
+  downloaded_at: string | null;
+  last_download_error: string | null;
 };
 
 type RelatedEntity = {
@@ -53,6 +87,8 @@ type RelatedEntity = {
   notion_page_id?: string | null;
   revision?: number;
 };
+
+type DailySession = DailySessionRecord;
 
 type NormalizedAnalysis = ReturnType<typeof normalizeAnalysisDecision>;
 type SanitizedAnalysisResult = ReturnType<typeof sanitizeAnalysisResult>;
@@ -468,6 +504,543 @@ function buildFallbackAnalysis(input: {
   };
 }
 
+function buildAttachmentContext(attachments: InboxAttachment[]): string | null {
+  if (!attachments.length) {
+    return null;
+  }
+
+  const labels = attachments.map((attachment) => {
+    const name = attachment.file_name?.trim();
+    if (name) {
+      return `${attachment.attachment_type}: ${name}`;
+    }
+
+    return attachment.attachment_type;
+  });
+
+  return `Входящее сообщение без текста. Вложения: ${labels.join(", ")}.`;
+}
+
+function countWords(value?: string | null): number {
+  return (value ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .length;
+}
+
+function normalizeText(value?: string | null): string {
+  return value?.replace(/\s+/g, " ").trim() ?? "";
+}
+
+function looksLikeDisengagedReply(value?: string | null): boolean {
+  const text = normalizeText(value).toLowerCase();
+  if (!text) {
+    return true;
+  }
+
+  return [
+    "не хочу",
+    "не сейчас",
+    "потом",
+    "не знаю",
+    "без комментариев",
+    "отстань",
+    "не буду",
+  ].some((marker) => text.includes(marker));
+}
+
+function looksLikeCrisisReply(value?: string | null): boolean {
+  const text = normalizeText(value).toLowerCase();
+  if (!text) {
+    return false;
+  }
+
+  return [
+    "не хочу жить",
+    "хочу умереть",
+    "всё бессмысленно",
+    "не вижу смысла",
+    "хочу исчезнуть",
+    "очень плохо",
+    "паника",
+  ].some((marker) => text.includes(marker));
+}
+
+function looksLikeClarificationAboutQuestion(value?: string | null): boolean {
+  const text = normalizeText(value).toLowerCase();
+  if (!text) {
+    return false;
+  }
+
+  return [
+    "ты про что",
+    "про что ты",
+    "что ты имеешь в виду",
+    "что ты имеешь ввиду",
+    "что именно ты имеешь в виду",
+    "в смысле",
+    "не понял вопрос",
+    "не понял, о чем ты",
+    "о чем ты",
+    "какую неясность",
+  ].some((marker) => text.includes(marker));
+}
+
+function buildClarificationExplanation(input: {
+  topics: string[];
+  userReflection?: string | null;
+  clarificationQuestion?: string | null;
+}): string {
+  const baseReflection = normalizeText(input.userReflection);
+  const topic = input.topics[0];
+
+  if (topic === "неясность" || input.clarificationQuestion?.toLowerCase().includes("неясност")) {
+    if (baseReflection) {
+      return `Я про тот момент, где у тебя осталось ощущение, что что-то нужно делать, но пока непонятно что именно. Если коротко: что там сейчас ощущается самым подвешенным?`;
+    }
+
+    return "Я имею в виду тот момент, где как будто есть незакрытый вопрос, но пока нет ясного следующего шага. Что там сейчас ощущается самым подвешенным?";
+  }
+
+  if (topic === "свидание") {
+    return "Я про тему свидания: там сейчас больше всего вопрос в чувствах, в следующем шаге или просто в общей неопределённости?";
+  }
+
+  if (topic === "работа") {
+    return "Я про рабочую часть дня: что там осталось самым тяжёлым или незавершённым для тебя?";
+  }
+
+  return "Я имею в виду ту часть дня, которая для тебя осталась не до конца понятной или незавершённой. Если коротко, что там сейчас главное?";
+}
+
+function buildFallbackEveningReply(input: {
+  daySummary: string;
+  topics: string[];
+  userReply: string;
+  clarificationAlreadyAsked: boolean;
+}) {
+  const normalizedReply = normalizeText(input.userReply);
+  const repeatedTopic = input.topics.find((topic) =>
+    normalizedReply.toLowerCase().includes(topic.toLowerCase())
+  ) ?? null;
+
+  if (looksLikeCrisisReply(normalizedReply)) {
+    return {
+      classification: "crisis" as const,
+      userReflection: normalizedReply,
+      needsClarification: false,
+      clarificationQuestion: null,
+      repeatedTopic,
+      insightText: null,
+      closingText:
+        "Похоже, тебе сейчас правда очень тяжело. Если станет совсем небезопасно оставаться с этим одному, пожалуйста, свяжись с близким человеком или с местной службой поддержки прямо сейчас.",
+    };
+  }
+
+  if (looksLikeDisengagedReply(normalizedReply)) {
+    return {
+      classification: "disengaged" as const,
+      userReflection: normalizedReply,
+      needsClarification: false,
+      clarificationQuestion: null,
+      repeatedTopic,
+      insightText: null,
+      closingText: "Ок, не буду давить. Отдохни, я рядом, если захочешь вернуться к этому завтра.",
+    };
+  }
+
+  if (countWords(normalizedReply) < 15 && !input.clarificationAlreadyAsked) {
+    return {
+      classification: "brief" as const,
+      userReflection: normalizedReply,
+      needsClarification: true,
+      clarificationQuestion: repeatedTopic
+        ? `Что в теме ${repeatedTopic} было для тебя самым важным лично сегодня?`
+        : "Что из этого было самым важным лично для тебя?",
+      repeatedTopic,
+      insightText: null,
+      closingText: "",
+    };
+  }
+
+  return {
+    classification: "substantive" as const,
+    userReflection: normalizedReply,
+    needsClarification: false,
+    clarificationQuestion: null,
+    repeatedTopic,
+    insightText: repeatedTopic
+      ? `Смотрю, тема ${repeatedTopic} сегодня всплывала не раз. Это что-то, к чему стоит вернуться отдельно, как думаешь?`
+      : null,
+    closingText: repeatedTopic
+      ? `Спасибо, что поделился. Сохранил это; если завтра захочешь вернуться к теме ${repeatedTopic}, я напомню. Доброй ночи.`
+      : "Спасибо, что поделился. Сохранил это. Доброй ночи.",
+  };
+}
+
+async function findActiveEveningSession(
+  chatId: string,
+  createdAt: string,
+): Promise<DailySession | null> {
+  const sessionDate = getLocalDateString(new Date(createdAt));
+  const sessions = await getRows<DailySession>("daily_sessions", {
+    session_date: `eq.${sessionDate}`,
+    chat_id: `eq.${chatId}`,
+    select:
+      "id,session_date,status,prompt_text,summary_text,chat_id,sent_at,reminder_sent_at,responded_at,source_inbox_item_id,notion_page_id,notion_synced_at,metadata",
+    limit: 1,
+  });
+
+  const session = sessions[0];
+  if (!session?.sent_at || session.responded_at) {
+    return null;
+  }
+
+  if (new Date(createdAt).getTime() <= new Date(session.sent_at).getTime()) {
+    return null;
+  }
+
+  return session;
+}
+
+async function handleEveningReply(input: {
+  session: DailySession;
+  inboxItem: InboxItem;
+  textForAnalysis: string;
+  correlationId: string;
+}): Promise<{
+  consumed: boolean;
+  summary: string;
+  classification: string;
+}> {
+  const normalizedText = normalizeText(input.textForAnalysis);
+  if (!normalizedText || input.inboxItem.content_type !== "text") {
+    return {
+      consumed: false,
+      summary: "",
+      classification: "",
+    };
+  }
+
+  const metadata = (input.session.metadata ?? {}) as EveningSessionMetadata;
+  const clarificationAlreadyAsked = Boolean(metadata.clarificationAsked);
+
+  let replyPlan;
+  try {
+    replyPlan = await analyzeEveningReply({
+      daySummary: metadata.daySummary ?? input.session.summary_text ?? "",
+      topics: metadata.topics ?? [],
+      userReply: normalizedText,
+      clarificationAlreadyAsked,
+    });
+  } catch (error) {
+    logWarn("process_inbox_evening_reply_fallback_used", {
+      correlationId: input.correlationId,
+      sessionId: input.session.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    replyPlan = buildFallbackEveningReply({
+      daySummary: metadata.daySummary ?? input.session.summary_text ?? "",
+      topics: metadata.topics ?? [],
+      userReply: normalizedText,
+      clarificationAlreadyAsked,
+    });
+  }
+
+  const insightCandidates: EveningInsightCandidate[] = metadata.insightCandidates ?? [];
+  if (replyPlan.insightText) {
+    insightCandidates.push({
+      text: replyPlan.insightText,
+      topic: replyPlan.repeatedTopic,
+      confirmed_by_user: false,
+    });
+  }
+
+  if (
+    clarificationAlreadyAsked &&
+    looksLikeClarificationAboutQuestion(normalizedText)
+  ) {
+    const explanation = buildClarificationExplanation({
+      topics: metadata.topics ?? [],
+      userReflection: metadata.userReflection,
+      clarificationQuestion: metadata.clarificationQuestion ?? null,
+    });
+
+    await sendTelegramMessage(input.inboxItem.external_chat_id!, explanation);
+
+    const updatedMetadata: EveningSessionMetadata = {
+      ...metadata,
+      stage: "awaiting_clarification",
+      clarificationReply: normalizedText,
+      clarificationReplySourceId: input.inboxItem.id,
+    };
+
+    const updatedRows = await updateRows<DailySession>(
+      "daily_sessions",
+      { id: `eq.${input.session.id}` },
+      {
+        status: "clarifying",
+        source_inbox_item_id: input.inboxItem.id,
+        metadata: updatedMetadata,
+      },
+      {
+        select:
+          "id,session_date,status,prompt_text,summary_text,chat_id,sent_at,reminder_sent_at,responded_at,source_inbox_item_id,notion_page_id,notion_synced_at,metadata",
+      },
+    );
+
+    const updatedSession = updatedRows[0] ?? {
+      ...input.session,
+      status: "clarifying",
+      source_inbox_item_id: input.inboxItem.id,
+      metadata: updatedMetadata,
+    };
+
+    const notionSync = await syncEveningSessionToNotion({
+      session: updatedSession,
+      userVisibleSummary: metadata.daySummary ?? input.session.summary_text ?? "Вечерний чек-ин",
+      updateSummary: "Пользователь попросил пояснить уточняющий вопрос",
+      updateText: normalizedText,
+      updateSourceId: input.inboxItem.id,
+    });
+
+    await updateRows(
+      "daily_sessions",
+      { id: `eq.${input.session.id}` },
+      {
+        notion_page_id: notionSync.notionPageId,
+        notion_synced_at: notionSync.notionSyncedAt,
+        notion_last_error: notionSync.notionLastError,
+      },
+    );
+
+    return {
+      consumed: true,
+      summary: normalizedText,
+      classification: "evening_dialog_clarification_explained",
+    };
+  }
+
+  if (replyPlan.needsClarification && replyPlan.clarificationQuestion) {
+    await sendTelegramMessage(input.inboxItem.external_chat_id!, replyPlan.clarificationQuestion);
+
+    const updatedMetadata: EveningSessionMetadata = {
+      ...metadata,
+      stage: "awaiting_clarification",
+      clarificationAsked: true,
+      clarificationQuestion: replyPlan.clarificationQuestion,
+      userReflection: replyPlan.userReflection,
+      userReflectionSourceId: input.inboxItem.id,
+      insightCandidates,
+    };
+
+    const updatedRows = await updateRows<DailySession>(
+      "daily_sessions",
+      { id: `eq.${input.session.id}` },
+      {
+        status: "clarifying",
+        source_inbox_item_id: input.inboxItem.id,
+        metadata: updatedMetadata,
+      },
+      {
+        select:
+          "id,session_date,status,prompt_text,summary_text,chat_id,sent_at,reminder_sent_at,responded_at,source_inbox_item_id,notion_page_id,notion_synced_at,metadata",
+      },
+    );
+
+    const updatedSession = updatedRows[0] ?? {
+      ...input.session,
+      status: "clarifying",
+      metadata: updatedMetadata,
+      source_inbox_item_id: input.inboxItem.id,
+    };
+
+    const notionSync = await syncEveningSessionToNotion({
+      session: updatedSession,
+      userVisibleSummary: metadata.daySummary ?? input.session.summary_text ?? "Вечерний чек-ин",
+      updateSummary: "Пользователь ответил коротко, задан один уточняющий вопрос",
+      updateText: replyPlan.userReflection,
+      updateSourceId: input.inboxItem.id,
+    });
+
+    await updateRows(
+      "daily_sessions",
+      { id: `eq.${input.session.id}` },
+      {
+        notion_page_id: notionSync.notionPageId,
+        notion_synced_at: notionSync.notionSyncedAt,
+        notion_last_error: notionSync.notionLastError,
+      },
+    );
+
+    return {
+      consumed: true,
+      summary: replyPlan.userReflection,
+      classification: "evening_dialog_brief",
+    };
+  }
+
+  const closingParts = [
+    replyPlan.insightText,
+    replyPlan.closingText,
+  ].filter((value) => value && value.trim());
+  const finalMessage = closingParts.join("\n\n");
+
+  if (finalMessage) {
+    await sendTelegramMessage(input.inboxItem.external_chat_id!, finalMessage);
+  }
+
+  const updatedMetadata: EveningSessionMetadata = {
+    ...metadata,
+    stage: "completed",
+    userReflection: clarificationAlreadyAsked
+      ? metadata.userReflection ?? replyPlan.userReflection
+      : replyPlan.userReflection,
+    userReflectionSourceId: clarificationAlreadyAsked
+      ? metadata.userReflectionSourceId ?? input.inboxItem.id
+      : input.inboxItem.id,
+    clarificationReply: clarificationAlreadyAsked ? replyPlan.userReflection : metadata.clarificationReply,
+    clarificationReplySourceId: clarificationAlreadyAsked ? input.inboxItem.id : metadata.clarificationReplySourceId,
+    insightCandidates,
+  };
+
+  const updatedRows = await updateRows<DailySession>(
+    "daily_sessions",
+    { id: `eq.${input.session.id}` },
+    {
+      responded_at: new Date().toISOString(),
+      status: "completed",
+      source_inbox_item_id: input.inboxItem.id,
+      metadata: updatedMetadata,
+    },
+    {
+      select:
+        "id,session_date,status,prompt_text,summary_text,chat_id,sent_at,reminder_sent_at,responded_at,source_inbox_item_id,notion_page_id,notion_synced_at,metadata",
+    },
+  );
+
+  const updatedSession = updatedRows[0] ?? {
+    ...input.session,
+    responded_at: new Date().toISOString(),
+    status: "completed",
+    source_inbox_item_id: input.inboxItem.id,
+    metadata: updatedMetadata,
+  };
+
+  const notionSync = await syncEveningSessionToNotion({
+    session: updatedSession,
+    userVisibleSummary: metadata.daySummary ?? input.session.summary_text ?? "Вечерний чек-ин",
+    updateSummary: "Пользователь завершил вечерний чек-ин",
+    updateText: clarificationAlreadyAsked
+      ? `${metadata.userReflection ?? ""}\n${replyPlan.userReflection}`.trim()
+      : replyPlan.userReflection,
+    updateSourceId: input.inboxItem.id,
+  });
+
+  await updateRows(
+    "daily_sessions",
+    { id: `eq.${input.session.id}` },
+    {
+      notion_page_id: notionSync.notionPageId,
+      notion_synced_at: notionSync.notionSyncedAt,
+      notion_last_error: notionSync.notionLastError,
+    },
+  );
+
+  return {
+    consumed: true,
+    summary: replyPlan.userReflection,
+    classification: `evening_dialog_${replyPlan.classification}`,
+  };
+}
+
+function isRetryableError(errorMessage: string): boolean {
+  return [
+    "timed out",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "network",
+    "fetch",
+    "connection",
+    "uploadObject",
+    "downloadTelegramFile",
+    "OpenRouter API error: 5",
+  ].some((token) => errorMessage.toLowerCase().includes(token.toLowerCase()));
+}
+
+function computeBackoffSeconds(attemptCount: number): number {
+  return retryBaseSeconds * Math.max(1, 2 ** Math.max(0, attemptCount - 1));
+}
+
+async function checksumSha256(input: Uint8Array): Promise<string> {
+  const normalized = Uint8Array.from(input);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    normalized,
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function ensureAttachmentsStored(
+  attachments: InboxAttachment[],
+  correlationId: string,
+): Promise<void> {
+  for (const attachment of attachments) {
+    if (attachment.downloaded_at || !attachment.telegram_file_id) {
+      continue;
+    }
+
+    try {
+      const file = await downloadTelegramFile(attachment.telegram_file_id);
+      await uploadObject({
+        bucket: attachment.storage_bucket,
+        path: attachment.storage_path,
+        body: file.body,
+        contentType: attachment.mime_type ?? file.contentType,
+      });
+
+      await updateRows(
+        "inbox_attachments",
+        {
+          id: `eq.${attachment.id}`,
+        },
+        {
+          checksum_sha256: await checksumSha256(file.body),
+          downloaded_at: new Date().toISOString(),
+          last_download_error: null,
+          metadata: {
+            telegram_file_path: file.filePath,
+            stored_via: "process-inbox",
+          },
+        },
+      );
+    } catch (error) {
+      await updateRows(
+        "inbox_attachments",
+        {
+          id: `eq.${attachment.id}`,
+        },
+        {
+          last_download_error: error instanceof Error ? error.message : String(error),
+        },
+      );
+
+      logWarn("process_inbox_attachment_capture_failed", {
+        correlationId,
+        attachmentId: attachment.id,
+      });
+
+      throw error;
+    }
+  }
+}
+
 Deno.serve(async (request) => {
   const correlationId = getCorrelationId(request);
   let claimedJob: ClaimedJob | undefined;
@@ -516,14 +1089,22 @@ Deno.serve(async (request) => {
 
     const inboxItems = await getRows<InboxItem>("inbox_items", {
       id: `eq.${claimedJob.inbox_item_id}`,
-      select: "id,content_type,original_text,external_chat_id",
+      select: "id,content_type,original_text,external_chat_id,created_at",
       limit: 1,
     });
-
     const inboxItem = inboxItems[0];
     if (!inboxItem) {
       throw new Error(`Inbox item not found for job ${claimedJob.id}`);
     }
+
+    const attachments = await getRows<InboxAttachment>("inbox_attachments", {
+      inbox_item_id: `eq.${inboxItem.id}`,
+      select:
+        "id,attachment_type,telegram_file_id,storage_bucket,storage_path,mime_type,file_name,downloaded_at,last_download_error",
+      order: "created_at.asc",
+      limit: 20,
+    });
+    await ensureAttachmentsStored(attachments, correlationId);
 
     const relatedEntities = await getRows<RelatedEntity>("proposed_entities", {
       status: "eq.proposed",
@@ -532,11 +1113,97 @@ Deno.serve(async (request) => {
       limit: 25,
     });
 
+    const textForAnalysis = inboxItem.original_text?.trim() ||
+      buildAttachmentContext(attachments);
+
+    if (inboxItem.external_chat_id && textForAnalysis) {
+      const activeEveningSession = await findActiveEveningSession(
+        inboxItem.external_chat_id,
+        inboxItem.created_at,
+      );
+
+      if (activeEveningSession) {
+        const eveningReply = await handleEveningReply({
+          session: activeEveningSession,
+          inboxItem,
+          textForAnalysis,
+          correlationId,
+        });
+
+        if (eveningReply.consumed) {
+          await insertRow(
+            "item_analysis",
+            {
+              inbox_item_id: inboxItem.id,
+              analysis_type: "evening_dialog",
+              model_provider: "openrouter",
+              model_name: getOpenRouterModel(),
+              output_text: eveningReply.summary,
+              output_json: {
+                classification: eveningReply.classification,
+                summary: eveningReply.summary,
+              },
+              confidence: 0.8,
+            },
+            {
+              select: "id",
+            },
+          );
+
+          await updateRows(
+            "inbox_items",
+            {
+              id: `eq.${inboxItem.id}`,
+            },
+            {
+              processing_status: "processed",
+              processed_at: new Date().toISOString(),
+              preliminary_type: eveningReply.classification,
+              preliminary_summary: eveningReply.summary,
+              ai_confidence: 0.8,
+              locked_at: null,
+              locked_by: null,
+              next_retry_at: null,
+              last_error_message: null,
+              updated_by: "ai",
+            },
+          );
+
+          await updateRows(
+            "processing_jobs",
+            {
+              id: `eq.${claimedJob.id}`,
+            },
+            {
+              status: "completed",
+              completed_at: new Date().toISOString(),
+              locked_at: null,
+              locked_by: null,
+              next_retry_at: null,
+              last_error_message: null,
+              result: {
+                classification: eveningReply.classification,
+                summary: eveningReply.summary,
+              },
+            },
+          );
+
+          return jsonResponse({
+            ok: true,
+            correlationId,
+            status: "processed_evening_dialog",
+            jobId: claimedJob.id,
+            inboxItemId: inboxItem.id,
+          });
+        }
+      }
+    }
+
     let analysis: Awaited<ReturnType<typeof classifyInboxItem>>;
     try {
       analysis = await classifyInboxItem({
         contentType: inboxItem.content_type,
-        text: inboxItem.original_text,
+        text: textForAnalysis,
         relatedEntities: relatedEntities
           .filter((entity) =>
             entity.entity_type === "goal" || entity.entity_type === "project"
@@ -561,7 +1228,7 @@ Deno.serve(async (request) => {
       analysis = {
         rawText: "FALLBACK_ANALYSIS",
         result: buildFallbackAnalysis({
-          text: inboxItem.original_text,
+          text: textForAnalysis,
           relatedEntities,
         }),
       };
@@ -569,11 +1236,11 @@ Deno.serve(async (request) => {
 
     const sanitizedAnalysis: SanitizedAnalysisResult = sanitizeAnalysisResult({
       result: analysis.result,
-      originalText: inboxItem.original_text,
+      originalText: textForAnalysis,
     });
 
     const normalizedAnalysis: NormalizedAnalysis = normalizeAnalysisDecision({
-      text: inboxItem.original_text,
+      text: textForAnalysis,
       result: sanitizedAnalysis,
       relatedEntities,
     });
@@ -679,6 +1346,8 @@ Deno.serve(async (request) => {
         ai_confidence: sanitizedAnalysis.confidence ?? null,
         locked_at: null,
         locked_by: null,
+        next_retry_at: null,
+        last_error_message: null,
         updated_by: "ai",
       },
     );
@@ -693,6 +1362,8 @@ Deno.serve(async (request) => {
         completed_at: new Date().toISOString(),
         locked_at: null,
         locked_by: null,
+        next_retry_at: null,
+        last_error_message: null,
         result: {
           classification: sanitizedAnalysis.classification,
           summary: sanitizedAnalysis.summary,
@@ -739,6 +1410,66 @@ Deno.serve(async (request) => {
 
     if (claimedJob) {
       try {
+        const [jobState] = await getRows<ProcessingJobState>("processing_jobs", {
+          id: `eq.${claimedJob.id}`,
+          select: "id,attempt_count,max_attempts",
+          limit: 1,
+        });
+
+        const canRetry = jobState
+          ? jobState.attempt_count < jobState.max_attempts &&
+            isRetryableError(message)
+          : false;
+
+        if (canRetry) {
+          const retryAt = new Date(
+            Date.now() + computeBackoffSeconds(jobState.attempt_count) * 1000,
+          ).toISOString();
+
+          await updateRows(
+            "processing_jobs",
+            {
+              id: `eq.${claimedJob.id}`,
+            },
+            {
+              status: "pending",
+              next_retry_at: retryAt,
+              locked_at: null,
+              locked_by: null,
+              last_error_message: message,
+            },
+          );
+
+          await updateRows(
+            "inbox_items",
+            {
+              id: `eq.${claimedJob.inbox_item_id}`,
+            },
+            {
+              processing_status: "pending",
+              retry_count: jobState.attempt_count,
+              next_retry_at: retryAt,
+              last_error_message: message,
+              locked_at: null,
+              locked_by: null,
+              updated_by: "system",
+            },
+          );
+
+          logWarn("process_inbox_retry_scheduled", {
+            correlationId,
+            claimedJobId: claimedJob.id,
+            retryAt,
+          });
+
+          return jsonResponse({
+            ok: false,
+            correlationId,
+            status: "retry_scheduled",
+            retryAt,
+          }, { status: 202 });
+        }
+
         await updateRows(
           "processing_jobs",
           {

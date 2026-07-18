@@ -2,6 +2,22 @@ import { requireEnv } from "./env.ts";
 
 const notionApiKey = requireEnv("NOTION_API_KEY");
 const notionVersion = "2026-03-11";
+const allowedTargetAliases = new Set([
+  "Inbox",
+  "Goals",
+  "Projects",
+  "Weekly",
+  "Evening",
+  "Memory",
+  "Finance",
+  "Inbox".toLowerCase(),
+  "Goals".toLowerCase(),
+  "Projects".toLowerCase(),
+  "Weekly".toLowerCase(),
+  "Evening".toLowerCase(),
+  "Memory".toLowerCase(),
+  "Finance".toLowerCase(),
+]);
 
 type NotionPageCreateResult = {
   id: string;
@@ -12,6 +28,15 @@ type NotionDetails = {
   label: string;
   value: string;
 };
+
+function truncateForNotion(value: string, maxLength = 1800): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, maxLength - 1)}…`;
+}
 
 function headers(): HeadersInit {
   return {
@@ -32,6 +57,19 @@ async function parseJsonResponse(response: Response): Promise<unknown> {
 
 export function parseNotionTargets(raw: string): Record<string, string> {
   const parsed = JSON.parse(raw) as Record<string, string>;
+
+  for (const [alias, pageId] of Object.entries(parsed)) {
+    if (!allowedTargetAliases.has(alias)) {
+      throw new Error(
+        `Unsupported Notion target alias "${alias}". Life OS works only with the configured root pages inside one dedicated workspace.`,
+      );
+    }
+
+    if (!pageId || typeof pageId !== "string") {
+      throw new Error(`Invalid Notion page id for alias "${alias}"`);
+    }
+  }
+
   return parsed;
 }
 
@@ -54,7 +92,7 @@ export async function createChildPage(input: {
           {
             type: "text",
             text: {
-              content: input.summary,
+              content: truncateForNotion(input.summary),
             },
           },
         ],
@@ -75,7 +113,7 @@ export async function createChildPage(input: {
           {
             type: "text",
             text: {
-              content: `${detail.label}: ${detail.value}`,
+              content: truncateForNotion(`${detail.label}: ${detail.value}`),
             },
           },
         ],
@@ -92,7 +130,7 @@ export async function createChildPage(input: {
           {
             type: "text",
             text: {
-              content: `Исходное сообщение: ${input.originalText}`,
+              content: truncateForNotion(`Исходное сообщение: ${input.originalText}`),
             },
           },
         ],
@@ -106,13 +144,13 @@ export async function createChildPage(input: {
     paragraph: {
       rich_text: [
         {
-          type: "text",
-          text: {
-            content: `Life OS source id: ${input.sourceId}`,
+            type: "text",
+            text: {
+              content: truncateForNotion(`Life OS source id: ${input.sourceId}`),
+            },
           },
-        },
-      ],
-    },
+        ],
+      },
   });
 
   const response = await fetch("https://api.notion.com/v1/pages", {
@@ -215,7 +253,7 @@ export async function appendPageUpdate(input: {
           {
             type: "text",
             text: {
-              content: input.summary,
+              content: truncateForNotion(input.summary),
             },
           },
         ],
@@ -236,7 +274,7 @@ export async function appendPageUpdate(input: {
           {
             type: "text",
             text: {
-              content: `${detail.label}: ${detail.value}`,
+              content: truncateForNotion(`${detail.label}: ${detail.value}`),
             },
           },
         ],
@@ -253,7 +291,7 @@ export async function appendPageUpdate(input: {
           {
             type: "text",
             text: {
-              content: `Уточнение пользователя: ${input.originalText}`,
+              content: truncateForNotion(`Уточнение пользователя: ${input.originalText}`),
             },
           },
         ],
@@ -267,13 +305,13 @@ export async function appendPageUpdate(input: {
     paragraph: {
       rich_text: [
         {
-          type: "text",
-          text: {
-            content: `Life OS source id: ${input.sourceId}`,
+            type: "text",
+            text: {
+              content: truncateForNotion(`Life OS source id: ${input.sourceId}`),
+            },
           },
-        },
-      ],
-    },
+        ],
+      },
   });
 
   const response = await fetch(
